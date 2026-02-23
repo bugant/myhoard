@@ -8,7 +8,7 @@ from myhoard.basebackup_restore_operation import BasebackupRestoreOperation
 from myhoard.controller import Backup, BaseBackup, Controller, sort_completed_backups
 from myhoard.restore_coordinator import RestoreCoordinator
 from myhoard.util import (
-    change_master_to,
+    change_replication_source_to,
     get_xtrabackup_version,
     GtidExecuted,
     make_fs_metadata,
@@ -19,7 +19,7 @@ from myhoard.util import (
 )
 from rohmu import get_transfer
 from typing import Any, Callable, cast, Dict, List, Optional, Set, TypedDict
-from unittest.mock import MagicMock, patch
+from unittest.mock import call, MagicMock, patch
 
 import contextlib
 import datetime
@@ -297,7 +297,7 @@ def test_promoted_node_does_not_resume_streams_for_backups_initiated_by_old_mast
         # Simulate a case where the old/leaving master creates a new
         # backup after the promotion process of the standby was triggered.
         with mysql_cursor(**standby1.connect_options) as cursor:
-            cursor.execute("STOP SLAVE IO_THREAD")
+            cursor.execute("STOP REPLICA IO_THREAD")
         s1_controller.switch_to_active_mode()
 
         m_controller.mark_backup_requested(backup_reason=BackupStream.BackupReason.requested)
@@ -496,19 +496,19 @@ def test_3_node_service_failover_and_restore(
         # Note that we're not stopping master or data generation to master here to ensure rogue master case works.
         with mysql_cursor(**standby1.connect_options) as cursor1:
             with mysql_cursor(**standby2.connect_options) as cursor2:
-                cursor1.execute("STOP SLAVE IO_THREAD")
-                cursor2.execute("STOP SLAVE IO_THREAD")
+                cursor1.execute("STOP REPLICA IO_THREAD")
+                cursor2.execute("STOP REPLICA IO_THREAD")
 
                 # Wait for SQL threads to apply any relay logs that got downloaded from master
                 def relay_log_applied():
                     for cursor in [cursor1, cursor2]:
-                        cursor.execute("SHOW SLAVE STATUS")
-                        status = cursor.fetchone()["Slave_SQL_Running_State"]
+                        cursor.execute("SHOW REPLICA STATUS")
+                        status = cursor.fetchone()["Replica_SQL_Running_State"]
                         assert re.match("(Slave|Replica) has read all relay log; waiting for more updates", status)
 
                 while_asserts(relay_log_applied, timeout=30)
-                cursor1.execute("STOP SLAVE SQL_THREAD")
-                cursor2.execute("STOP SLAVE SQL_THREAD")
+                cursor1.execute("STOP REPLICA SQL_THREAD")
+                cursor2.execute("STOP REPLICA SQL_THREAD")
 
                 # Pick whichever standby got furthest in replication as new master
                 cursor1.execute("SELECT @@GLOBAL.gtid_executed AS executed")
@@ -547,17 +547,17 @@ def test_3_node_service_failover_and_restore(
                 s3controller[0].restore_backup(site=backup["site"], stream_id=backup["stream_id"])
 
                 master_options = {
-                    "MASTER_AUTO_POSITION": 1,
-                    "MASTER_CONNECT_RETRY": 0.1,
-                    "MASTER_HOST": "127.0.0.1",
-                    "MASTER_PASSWORD": new_master.password,
-                    "MASTER_PORT": new_master.port,
-                    "MASTER_SSL": 0,
-                    "MASTER_USER": master.user,
+                    "SOURCE_AUTO_POSITION": 1,
+                    "SOURCE_CONNECT_RETRY": 0.1,
+                    "SOURCE_HOST": "127.0.0.1",
+                    "SOURCE_PASSWORD": new_master.password,
+                    "SOURCE_PORT": new_master.port,
+                    "SOURCE_SSL": 0,
+                    "SOURCE_USER": master.user,
                 }
                 new_mcontroller.switch_to_active_mode()
-                change_master_to(cursor=standby_cursor, options=master_options)
-                standby_cursor.execute("START SLAVE IO_THREAD, SQL_THREAD")
+                change_replication_source_to(cursor=standby_cursor, options=master_options)
+                standby_cursor.execute("START REPLICA IO_THREAD, SQL_THREAD")
 
                 # Wait for backup promotion steps to complete
                 wait_for_condition(lambda: new_mcontroller.mode == Controller.Mode.active, timeout=30)
@@ -603,8 +603,8 @@ def test_3_node_service_failover_and_restore(
                 wait_for_condition(restore_complete, timeout=120)
 
                 with mysql_cursor(**mysql_empty.connect_options) as standby3_cursor:
-                    change_master_to(cursor=standby3_cursor, options=master_options)
-                    standby3_cursor.execute("START SLAVE IO_THREAD, SQL_THREAD")
+                    change_replication_source_to(cursor=standby3_cursor, options=master_options)
+                    standby3_cursor.execute("START REPLICA IO_THREAD, SQL_THREAD")
                     s3controller[0].switch_to_observe_mode()
 
                     time.sleep(phase_duration)
@@ -710,6 +710,142 @@ def test_3_node_service_failover_and_restore(
         assert controller.backup_streams[0].state["backup_errors"] == 0
         assert controller.backup_streams[0].state["remote_read_errors"] == 0
         assert controller.backup_streams[0].state["remote_write_errors"] == 0
+
+
+@pytest.mark.parametrize(
+    "standby_fixture_name, expect_remote_copy",
+    [
+        ("standby1_controller", True),
+        ("standby1_controller_cross_site", False),
+    ],
+    ids=["same_site", "cross_site"],
+)
+def test_remote_copy_behavior(
+    request,
+    master_controller,
+    standby_fixture_name,
+    expect_remote_copy,
+):
+    """Verify remote-copy behavior depending on whether backup streams share the same site.
+
+    When both streams target the same site, the second stream should use remote-copy
+    instead of uploading from local disk.
+
+    When streams target different sites, remote copies are forbidden and
+    the second stream must upload from local disk. This is because in real-life
+    sites would represents prefixes on cloud object storage buckets. When sites are
+    different, there is no way to make sure they are on the same cloud provider or
+    not.
+
+    Scenario:
+    - Master creates a backup on the 'default' site.
+    - Standby observes master's backup, then is promoted to active mode.
+    - A new backup is requested, creating a second stream.
+    - Both streams see the same local binlog indexes. When stream A uploads a binlog,
+      the reference is passed to stream B. Depending on whether they share the same
+      site, stream B either does a remote-copy or uploads from local disk.
+    """
+    mcontroller, master = master_controller
+    s1controller, standby1 = request.getfixturevalue(standby_fixture_name)
+
+    # Set unknown replication state so that binary logs won't be purged
+    mcontroller.state_manager.update_state(replication_state={"s1": {}})
+    mcontroller.binlog_purge_settings["min_binlog_age_before_purge"] = 1
+    mcontroller.binlog_purge_settings["purge_interval"] = 0.1
+
+    master_dg = DataGenerator(connect_info=master.connect_options, make_temp_tables=False)
+    try:
+        # Phase 1: Master creates initial backup on 'default' site
+        master_dg.start()
+        time.sleep(1)
+        assert master_dg.row_count > 0
+
+        mcontroller.switch_to_active_mode()
+        mcontroller.start()
+
+        def master_streaming_binlogs():
+            assert mcontroller.backup_streams
+            assert mcontroller.backup_streams[0].active_phase == BackupStream.ActivePhase.binlog
+            complete_backups = [b for b in mcontroller.state["backups"] if b["completed_at"]]
+            assert len(complete_backups) >= 1
+
+        while_asserts(master_streaming_binlogs, timeout=30)
+
+        # Phase 2: Standby observes, then promotes
+        # Stop slave threads (required for observe -> promote transition)
+        with mysql_cursor(**standby1.connect_options) as cursor:
+            cursor.execute("STOP REPLICA")
+
+        s1controller.switch_to_observe_mode()
+        s1controller.start()
+
+        # Wait for standby to discover the master's backup on 'default' site
+        def standby_discovered_backup():
+            assert s1controller.state["backups_fetched_at"] != 0
+            assert len(s1controller.state["backups"]) >= 1
+
+        while_asserts(standby_discovered_backup, timeout=15)
+
+        # Promote standby to active mode
+        s1controller.switch_to_active_mode()
+
+        # Wait for promotion to complete (controller mode becomes active)
+        def standby_is_active():
+            assert s1controller.mode == Controller.Mode.active
+
+        while_asserts(standby_is_active, timeout=15)
+
+        # Replace stats with MagicMock to track remote_copy vs upload calls
+        s1controller.stats = MagicMock()
+
+        # Request a new backup — creates a stream on the standby's upload site
+        s1controller.mark_backup_requested(backup_reason=BackupStream.BackupReason.requested)
+
+        # Turn off read_only so the standby can generate binlogs
+        with mysql_cursor(**standby1.connect_options) as cursor:
+            cursor.execute("SET GLOBAL read_only = 0")
+
+        # Generate data and flush binlogs so both streams have binlogs to upload
+        standby_dg = DataGenerator(connect_info=standby1.connect_options, make_temp_tables=False)
+        standby_dg.start()
+
+        try:
+            # Wait for the new backup to complete its basebackup phase and start uploading binlogs.
+            # During binlog_catchup of the new stream, both streams upload binlogs simultaneously,
+            # which is the window where remote-copy optimization or cross-site guard is exercised.
+            def standby_has_two_completed_backups():
+                # Generate some flushes to create binlogs for both streams to upload
+                with mysql_cursor(**standby1.connect_options) as cursor:
+                    foo_suffix = str(time.time()).replace(".", "_")
+                    cursor.execute(f"CREATE TABLE IF NOT EXISTS foo_{foo_suffix} (id INTEGER)")
+                    cursor.execute("COMMIT")
+                    cursor.execute("FLUSH BINARY LOGS")
+                complete_backups = [b for b in s1controller.state["backups"] if b["completed_at"]]
+                assert len(complete_backups) >= 2
+
+            while_asserts(standby_has_two_completed_backups, timeout=30)
+
+            # At this point the new backup has completed and both streams have uploaded binlogs.
+            if expect_remote_copy:
+                # Same site: verify that binlog uploads happened via remote copy
+                s1controller.stats.increase.assert_any_call("myhoard.binlog.remote_copy")
+            else:
+                # Cross site: verify uploads happened from local disk but NO remote copies
+                s1controller.stats.increase.assert_any_call("myhoard.binlog.upload")
+                remote_copy_calls = [
+                    c for c in s1controller.stats.increase.call_args_list if c == call("myhoard.binlog.remote_copy")
+                ]
+                assert (
+                    [] == remote_copy_calls
+                ), f"Expected no remote copies due to cross-site guard, but found {len(remote_copy_calls)} remote copy calls"
+        finally:
+            standby_dg.stop()
+    finally:
+        master_dg.stop()
+        mcontroller.stop()
+        s1controller.stop()
+
+    assert s1controller.state["errors"] == 0
 
 
 def test_empty_server_backup_and_restore(
